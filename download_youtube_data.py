@@ -36,6 +36,7 @@ import os
 import shutil
 import pickle
 
+DRIVER_PATH = "C://Users//along//VS Code//Shorts Project//chromium//chromedriver.exe"
 api_key = 'AIzaSyDuCDLpv1XKwlv1ZLeG8WSkyEH2PwHRgkk'
 WHISPER_MODEL = "medium.en"
 
