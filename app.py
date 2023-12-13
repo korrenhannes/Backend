@@ -9,8 +9,7 @@ from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError
 from dotenv import load_dotenv
 
-from download_youtube_data import YoutubeData
-from edit_youtube_video import EditedVideos
+from best_clips import BestClips
 
 # Load environment variables
 load_dotenv()
@@ -69,55 +68,69 @@ def set_upload_complete(userEmail, complete):
         print(f"An error occurred while setting upload_complete for {userEmail}: {e}")
         raise e  # Reraising the exception will help to identify if there is an issue with the database operation
 
-def upload_to_gcloud(bucket_name, source_file_name, destination_blob_name, userEmail):
+def upload_to_gcloud(bucket, video_file_name, json_file_name, video_destination_blob_name, json_destination_blob_name, userEmail):
     if not userEmail:
         print("Error: User ID is None or empty.")
         return False
+    
+    user_prev_runs_path_video = f"{userEmail}/PreviousRuns/{video_destination_blob_name}"
+    user_cur_run_path_video = f"{userEmail}/CurrentRun/{video_destination_blob_name}"
+    user_prev_runs_path_json = f"{userEmail}/PreviousRuns/{json_destination_blob_name}"
+    user_cur_run_path_json = f"{userEmail}/CurrentRun/{json_destination_blob_name}"
 
-    # Create a user-specific path in the Google Cloud Storage bucket
-    user_specific_path = f"{userEmail}/{destination_blob_name}"
-
-    print(f"Uploading to Google Cloud Storage: {user_specific_path}")
-
-    if not os.path.isfile(source_file_name):
-        print(f"The file {source_file_name} does not exist.")
+    if not os.path.isfile(video_file_name):
+        print(f"The file {video_file_name} does not exist.")
+        return False
+    
+    if not os.path.isfile(json_file_name):
+        print(f"The file {json_file_name} does not exist.")
         return False
 
     try:
-        storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(user_specific_path)
-        blob.upload_from_filename(source_file_name)
-        print(f"File {source_file_name} uploaded to {user_specific_path}.")
+        blob_prev_video = bucket.blob(user_prev_runs_path_video)
+        blob_prev_video.upload_from_filename(video_file_name)
+        blob_prev_json = bucket.blob(user_prev_runs_path_json)
+        blob_prev_json.upload_from_filename(json_file_name)
+        blob_cur_video = bucket.blob(user_cur_run_path_video)
+        blob_cur_video.upload_from_filename(video_file_name)
+        blob_cur_json = bucket.blob(user_cur_run_path_json)
+        blob_cur_json.upload_from_filename(json_file_name)
+
+        print(f"File {video_file_name} and {json_file_name} uploaded to {user_cur_run_path_video}, {user_prev_runs_path_video} and {user_cur_run_path_json}, {user_prev_runs_path_json} respectively.")
         return True
     except Exception as e:
-        print(f"Failed to upload {source_file_name} to {user_specific_path}: {e}")
+        print(f"Failed to upload {video_file_name} or {json_file_name}: {e}")
         return False
-
 
 
 def process_youtube_video(link, userEmail):
     set_upload_complete(userEmail, False)  # Set the upload_complete flag to False at the start
-    base_dir = os.path.abspath(os.path.dirname(__file__))
-    # Change the save_folder_name to use the userEmail
-    save_folder_name = userEmail  
-    dest_folder = os.path.join(base_dir, save_folder_name)
+    
+    try:
+        username = userEmail  # Use userEmail for the folder name
 
-    if not os.path.exists(dest_folder):
-        os.makedirs(dest_folder)
+        # Pass save_folder_name to BestClips constructor
+        best_clips = BestClips(link, username, use_gpt=True) # Change use_gpt to True if you're not debugging and want to see the best parts
+        
+        gcloud_bucket_name = "clipitshorts"
+        # Delete all of the files in user_cur_run_path if they exist
+        storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+        bucket = storage_client.bucket(gcloud_bucket_name)
+        blobs = bucket.list_blobs(prefix=f"{userEmail}/CurrentRun/")
+        for blob in blobs:
+            blob.delete()
+        for i in range(len(best_clips.final_shorts)):
+            video_file_path = os.path.join(best_clips.run_path, f"short_{str(i)}.mp4")
+            json_file_path = os.path.join(best_clips.run_path, f"short_{str(i)}.json")
+            gcloud_video_destination_name = f"{best_clips.date_time_str}__{os.path.basename(video_file_path)}"
+            gcloud_json_destination_name = f"{best_clips.date_time_str}__{os.path.basename(json_file_path)}"
+            upload_to_gcloud(bucket, video_file_path, json_file_path, gcloud_video_destination_name, gcloud_json_destination_name, userEmail)
+        set_upload_complete(userEmail, True)
+        
+    except Exception as e:
+        print(f"An error occurred in process_youtube_video: {e}")
+        # Handle any other exceptions here
 
-    yt_data_obj = YoutubeData(link, save_folder_name, dest=dest_folder)
-    yt_data_obj.save_object()
-
-    edited_videos = EditedVideos(yt_data_obj, load_gpt=False)
-
-    gcloud_bucket_name = "clipitshorts"
-    for i in range(len(edited_videos.faced_subs_vids)):
-        video_file_path = os.path.join(yt_data_obj.dest, "finalvideo" + "_" + str(i) + ".mp4")
-        gcloud_destination_name = os.path.join(save_folder_name, os.path.basename(video_file_path))
-        # Use the userEmail as the folder name in the upload function
-        upload_to_gcloud(gcloud_bucket_name, video_file_path, gcloud_destination_name, userEmail)
-    set_upload_complete(userEmail, True)
 
 @app.route('/api/process-youtube-video', methods=['POST'])
 def handle_youtube_video():
@@ -142,14 +155,16 @@ def handle_youtube_video():
 
 @app.route('/api/signed-urls', methods=['GET'])
 def get_signed_urls():
-    # Extract user email from the request arguments instead of using a hardcoded value
-    email = request.args.get('email')
+    # Extract the user email from the request headers
+    email = request.headers.get('User-Email')
     print(f"get_signed_urls called with email: {email}")  # Additional logging for debugging
+
     if not email:
         return jsonify({'error': 'User email is required'}), 400
 
     bucket_name = 'clipitshorts'
     user = db.users.find_one({'email': email})
+
     if not user:
         # If the user is not found, assume no upload has started for this user
         directory_name = 'undefined/'
@@ -157,11 +172,15 @@ def get_signed_urls():
         # Use the directory based on the user's upload status
         directory_name = email + '/' if user.get('upload_complete', False) else 'undefined/'
 
-    storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
-    blobs = list(storage_client.list_blobs(bucket_name, prefix=directory_name))
-    signed_urls = [generate_signed_url(bucket_name, blob.name) for blob in blobs if not blob.name.endswith('/')]
+    try:
+        storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+        blobs = list(storage_client.list_blobs(bucket_name, prefix=directory_name))
+        signed_urls = [generate_signed_url(bucket_name, blob.name) for blob in blobs if not blob.name.endswith('/')]
 
-    return jsonify({'signedUrls': signed_urls})
+        return jsonify({'signedUrls': signed_urls})
+    except GoogleCloudError as e:
+        print(f"Error in getting signed URLs: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/user/payment-plan', methods=['GET'])

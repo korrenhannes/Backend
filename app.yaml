@@ -1,0 +1,12 @@
+runtime: python310
+entrypoint: gunicorn -b :$PORT main:app
+
+env_variables:
+  FLASK_ENV: "production"
+  GOOGLE_CLOUD_KEY_FILE: "C:\\Users\\SharonH\\Documents\\GitHub\\website\\my-website\\flash-yen-406511-fa4b2ef9402a.json"
+  DB_URI: "mongodb+srv://korren:Kokoman10@cluster0.hwmulir.mongodb.net/test?retryWrites=true&w=majority"
+
+instance_class: F4_1G  # Choose an appropriate instance class
+automatic_scaling:
+  min_instances: 1
+  max_instances: 5  # Set limits based on your needs
