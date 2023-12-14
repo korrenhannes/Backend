@@ -155,32 +155,40 @@ def handle_youtube_video():
 
 @app.route('/api/signed-urls', methods=['GET'])
 def get_signed_urls():
-    # Extract the user email from the request headers
-    email = request.headers.get('User-Email')
-    print(f"get_signed_urls called with email: {email}")  # Additional logging for debugging
-
-    if not email:
-        return jsonify({'error': 'User email is required'}), 400
-
-    bucket_name = 'clipitshorts'
-    user = db.users.find_one({'email': email})
-
-    if not user:
-        # If the user is not found, assume no upload has started for this user
-        directory_name = 'undefined/'
-    else:
-        # Use the directory based on the user's upload status
-        directory_name = email + '/' if user.get('upload_complete', False) else 'undefined/'
-
     try:
+        email = request.headers.get('User-Email')
+        if not email:
+            print("Missing User-Email header")
+            return jsonify({'error': 'User email is required'}), 400
+
+        directory = request.args.get('directory', default=f'{email}/CurrentRun/')
+        print(f"Requested directory: {directory}")  # Log the actual directory value
+
+        bucket_name = 'clipitshorts'
         storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
-        blobs = list(storage_client.list_blobs(bucket_name, prefix=directory_name))
-        signed_urls = [generate_signed_url(bucket_name, blob.name) for blob in blobs if not blob.name.endswith('/')]
+        blobs = storage_client.list_blobs(bucket_name, prefix=directory)
+        
+        if not blobs:
+            print("No blobs found in the specified directory")
+            return jsonify({'error': 'No videos found in the specified directory'}), 404
+
+        signed_urls = []
+        for blob in blobs:
+            if not blob.name.endswith('/'):
+                url = generate_signed_url(bucket_name, blob.name)
+                if url:
+                    signed_urls.append(url)
+                else:
+                    print(f"Error generating URL for blob: {blob.name}")
 
         return jsonify({'signedUrls': signed_urls})
     except GoogleCloudError as e:
-        print(f"Error in getting signed URLs: {e}")
+        print(f"Google Cloud Error: {e}")
         return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        return jsonify({'error': 'An unexpected error occurred'}), 500
+
 
 
 @app.route('/api/user/payment-plan', methods=['GET'])
