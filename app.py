@@ -158,11 +158,13 @@ def get_signed_urls_for_directory(bucket, directory):
     blobs = storage_client.list_blobs(bucket, prefix=directory)
     signed_urls = []
     for blob in blobs:
-        if not blob.name.endswith('/'):
+        # Check if the blob name ends with '.mp4'
+        if blob.name.lower().endswith('.mp4'):
             url = generate_signed_url(bucket, blob.name)
             if url:
                 signed_urls.append(url)
     return signed_urls
+
 
 @app.route('/api/signed-urls', methods=['GET'])
 def get_signed_urls():
@@ -171,13 +173,13 @@ def get_signed_urls():
         if not email:
             return jsonify({'error': 'User email is required'}), 400
 
-        directory = request.args.get('directory', default=f'{email}/PreviousRuns/')
+        directory = request.args.get('directory', default=f'{email}/CurrentRun/')
         bucket_name = 'clipitshorts'
 
         signed_urls = get_signed_urls_for_directory(bucket_name, directory)
 
         # Check if 'CurrentRun' is empty and fetch from 'undefined' if needed
-        if not signed_urls and 'PreviousRuns' in directory:
+        if not signed_urls and 'CurrentRun' in directory:
             directory = f'undefined/'
             signed_urls = get_signed_urls_for_directory(bucket_name, directory)
 
