@@ -3,26 +3,32 @@ import pandas as pd
 import numpy as np
 import os
 import re
-import torch
-import torch.multiprocessing as mp
 import random
 from datetime import datetime
+from google.cloud import storage
 from moviepy.editor import *
 from pytube import YouTube
 from tqdm import tqdm
 from openai import OpenAI
+import tempfile
 import imutils
 import cv2
 import nltk
 from nltk.sentiment import SentimentIntensityAnalyzer
 from retinaface import RetinaFace
+from dotenv import load_dotenv
 
+# Load .env file if it exists, useful for local development
+if os.path.exists('.env'):
+    load_dotenv()
 
 WHISPER_MODEL_FULL_TRANSCRIPT = "tiny.en"
 WHISPER_MODEL_INTERESTING_PARTS = "medium.en"
-DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+LEXICON_NAME = 'vader_lexicon'
 
 openai_api_key = "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"
+openai_api_key = os.environ.get('OPENAI_API_KEY')
 FIRST_INP =  "I'm going to send you a trascript of a podcast as a list of words with indices. I want to make an interesting 30-60 second clip from the podcast.\nI want you to send me a starting index and an ending index (around 120-150 words) so that the content adheres to the AIDA formula: Attention, Interest, Desire, and Action, using a hook at the start, a value bomb in the middle and a call to action at the end.\nMAKE SURE THAT THE END IS COHERENT - **THE FINISH INDEX IS AT THE END OF A SENTENCE!**\nSend me a response to see that you understood the expected format of your response (as if I sent you a long list of words)."
 FIRST_RES = "(17-153)"
 SECOND_INP = "Great! **KEEPING THE SAME FORMAT** IN YOUR RESPONSE AND ADDING NO MORE WORDS, here is the transcript:"
@@ -37,6 +43,10 @@ FONT_PATH = "Montserrat-Black.ttf"
 FACE_MODEL_CONFIDENCE_THRESH = 0.5
 MIN_AREA_RATIO_FACES = 4
 FPS_USED = None
+
+google_cloud_key_file = os.environ.get('GOOGLE_CLOUD_KEY_FILE')
+if not google_cloud_key_file or not os.path.exists(google_cloud_key_file):
+    raise ValueError("GOOGLE_CLOUD_KEY_FILE environment variable not set or file does not exist.")
 
 # I can move this to a utils file later
 def group_words(df, max_char_count, one_person_times, two_people_times):
@@ -123,7 +133,7 @@ def text_clip(text: str, duration: int, start_time: int = 0, one_person_on_scree
     color = 'white' if random.random() < 0.25 else 'Yellow'
     stroke_color = 'black'
     font = FONT_PATH
-    font_size = 60
+    font_size = 50
     placement = ('center', (1280 * (2/3))) if one_person_on_screen else ('center')
 
     return (TextClip(text.upper(), font=font, fontsize=font_size, size=(640, None), color=color, stroke_color=stroke_color, stroke_width=2.5, method='caption')
@@ -138,7 +148,7 @@ def add_subs_video(new_start_time, people_times, vid, df):
         one_person_times = [people_times['1_person'][i] + relevant_time_shift for i in range(len(people_times['1_person']))]
         two_people_times = [people_times['2_people'][i] + relevant_time_shift for i in range(len(people_times['2_people']))]
         relevant_time_shift += new_start_time
-        max_char_count = 18
+        max_char_count = 20
         grouped_words = group_words(df, max_char_count, one_person_times, two_people_times)
         txt_clips = [text_clip(group[0], group[2] - group[1], group[1] - relevant_time_shift, group[3]) for group in grouped_words]
         audio = vid.audio
@@ -156,7 +166,7 @@ def transcribe(segment_num, audio_clip, segment_time):
             ends = []
 
             # Whisper STT
-            model = whisper.load_model(WHISPER_MODEL_FULL_TRANSCRIPT, device=DEVICE)
+            model = whisper.load_model(WHISPER_MODEL_FULL_TRANSCRIPT)
             result = model.transcribe(audio_clip, word_timestamps=True)
 
             for segment in result['segments']:
@@ -171,26 +181,6 @@ def transcribe(segment_num, audio_clip, segment_time):
 
         except Exception as e:
             raise RuntimeError(f"Error transcribing audio segment: {e}")
-        
-
-def parallel_transcribe(rank, audio_segments, num_gpus, segment_time, transcript_dest):
-        try:
-            # Distribute the work among GPUs
-            start_idx = rank * len(audio_segments) // num_gpus
-            end_idx = (rank + 1) * len(audio_segments) // num_gpus
-
-            # Process a subset of audio_segments on the current GPU
-            subset_audio_segments = audio_segments[start_idx:end_idx]
-            transcription_dfs = [transcribe(idx, audio_clip, segment_time) for idx, audio_clip in tqdm(enumerate(subset_audio_segments))]
-
-            # Combine results
-            fin_transcription_df = pd.concat(transcription_dfs, ignore_index=True)
-
-            # Save results to CSV or perform any other processing
-            fin_transcription_df.to_csv(transcript_dest)
-
-        except Exception as e:
-            print(f"Error in parallel processing: {e}")
 
 
 def find_silent_segments(indices, silence_sec, fps_audio):
@@ -225,6 +215,41 @@ def final_segments(dur, silent_segments):
         complementary_ranges.append((current_start, dur))
 
     return complementary_ranges
+
+
+def upload_to_gcloud(bucket, video_file_name, json_file_name, video_destination_blob_name, json_destination_blob_name, userEmail):
+    if not userEmail:
+        print("Error: User ID is None or empty.")
+        return False
+    
+    user_prev_runs_path_video = f"{userEmail}/PreviousRuns/{video_destination_blob_name}"
+    user_cur_run_path_video = f"{userEmail}/CurrentRun/{video_destination_blob_name}"
+    user_prev_runs_path_json = f"{userEmail}/PreviousRuns/{json_destination_blob_name}"
+    user_cur_run_path_json = f"{userEmail}/CurrentRun/{json_destination_blob_name}"
+
+    if not os.path.isfile(video_file_name):
+        print(f"The file {video_file_name} does not exist.")
+        return False
+    
+    if not os.path.isfile(json_file_name):
+        print(f"The file {json_file_name} does not exist.")
+        return False
+
+    try:
+        blob_prev_video = bucket.blob(user_prev_runs_path_video)
+        blob_prev_video.upload_from_filename(video_file_name)
+        blob_prev_json = bucket.blob(user_prev_runs_path_json)
+        blob_prev_json.upload_from_filename(json_file_name)
+        blob_cur_video = bucket.blob(user_cur_run_path_video)
+        blob_cur_video.upload_from_filename(video_file_name)
+        blob_cur_json = bucket.blob(user_cur_run_path_json)
+        blob_cur_json.upload_from_filename(json_file_name)
+
+        print(f"File {video_file_name} and {json_file_name} uploaded to {user_cur_run_path_video}, {user_prev_runs_path_video} and {user_cur_run_path_json}, {user_prev_runs_path_json} respectively.")
+        return True
+    except Exception as e:
+        print(f"Failed to upload {video_file_name} or {json_file_name}: {e}")
+        return False
     
 
 class InvalidVideoError(Exception):
@@ -235,8 +260,6 @@ class BestClips:
                   interesting_word_transcript_dest="interesting_transcript.csv", num_of_shorts=5):
         try:
             self.num_of_shorts = num_of_shorts
-            # Set up everything for parallel processing
-            self.num_gpus = torch.cuda.device_count()
             
             # Set run-cost at 0
             self.use_gpt = use_gpt
@@ -245,8 +268,10 @@ class BestClips:
 
             # Creates relevant folders
             date_time = datetime.now()
+            self.temp_dir = tempfile.mkdtemp(dir="/app/temp")
             self.date_time_str = date_time.strftime("%d_%m_%Y__%H_%M_%S")
-            self.user_folder_name = username
+            self.user_name = username
+            self.user_folder_name = os.path.join(self.temp_dir, self.user_name)
             self.run_path = os.path.join(self.user_folder_name, self.date_time_str)
             self.create_run_folder() # Creates user folder if it doesn't exist and current run folder
 
@@ -263,12 +288,8 @@ class BestClips:
             self.full_word_transcript_dest = os.path.join(self.run_path, full_word_transcript_dest)
             self.full_audio, self.full_video = self.audio_video(self.video_path)
             self.full_audio.write_audiofile(self.audio_dest)
-            self.audio_segments, self.segment_time = self.split_audio_to_segments()
 
-            # Start parallel processing across GPUs
-            mp.spawn(parallel_transcribe, args=(self.audio_segments, max(1, self.num_gpus), self.segment_time, self.full_word_transcript_dest), nprocs= max(1, self.num_gpus))
-
-            full_words_df_tiny = pd.read_csv(self.full_word_transcript_dest)
+            full_words_df_tiny = self.transcribe()
             self.full_words_df_tiny = full_words_df_tiny.where(pd.notnull(full_words_df_tiny), 'None')
 
             self.sentence_df = self.make_sentence_df()
@@ -278,7 +299,7 @@ class BestClips:
 
             self.interesting_parts_dfs = self.transcribe_interesting_parts()
             for i in range(len(self.interesting_parts_dfs)):
-                self.interesting_parts_dfs[i].to_csv(os.path.join(self.user_folder_name, f"test_transcript_{i}.csv"))
+                self.interesting_parts_dfs[i].to_csv(os.path.join(self.run_path, f"test_transcript_{i}.csv"))
 
             # Make shorts
             self.chat_reply = [None for _ in range(self.num_of_shorts)]
@@ -295,7 +316,16 @@ class BestClips:
             print("Cutting out silent parts")
             self.final_shorts, self.json_transcription = self.remove_silence()
             print("Saving shorts!\n")
-            self.save_vids()     
+            self.save_vids()
+
+            # Move all to function if it works
+            print("Saving to cloud!\n")
+            gcloud_bucket_name = "clipitshorts"
+            storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+            self.bucket = storage_client.bucket(gcloud_bucket_name)
+            self.upload_to_cloud()
+            storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+            storage_client.close()
         except InvalidVideoError as e:
             print(f"Error: {e}")
         except Exception as e:
@@ -353,9 +383,36 @@ class BestClips:
         except Exception as e:
             raise RuntimeError(f"Error splitting audio into segments: {e}")
         
+
+    def transcribe(self):
+        whisper_freq = 16000
+        model = whisper.load_model(WHISPER_MODEL_FULL_TRANSCRIPT)
+        print("Transcribing using Whisper's 'tiny.en' model")
+        audio_clip = whisper.audio.load_audio(self.audio_dest, sr=whisper_freq)
+        texts = []
+        starts = []
+        ends = []
+
+        result = model.transcribe(audio_clip, word_timestamps=True)
+        for segment in result['segments']:
+            segment_word_data = segment['words']
+            for word_data in segment_word_data:
+                texts.append(word_data['word'].lstrip())
+                starts.append(word_data['start'])
+                ends.append(word_data['end'])
+
+        column_names = ["text", "start", "end"]
+        df = pd.DataFrame(np.array([texts, starts, ends]).transpose(), columns=column_names)
+
+        # Convert numeric columns to numeric type
+        for col in column_names[1:]:  # Skip the first column 'text'
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        return df
+
     
     def make_sentence_df(self, block_size=10):
-        nltk.download('vader_lexicon')
+        nltk.download(LEXICON_NAME)
         sia = SentimentIntensityAnalyzer()
 
         blocks = []
@@ -469,10 +526,10 @@ class BestClips:
         try:
             interesting_parts_dfs = []
             whisper_freq = 16000
-            model = whisper.load_model(WHISPER_MODEL_INTERESTING_PARTS, device=DEVICE)
+            model = whisper.load_model(WHISPER_MODEL_INTERESTING_PARTS)
             print("Transcribing interesting part using Whisper's 'medium.en' model")
             for short_num in tqdm(range(len(self.interesting_parts_audio))):
-                audio_dest = os.path.join(self.user_folder_name, f"audio_{short_num}.mp3")
+                audio_dest = os.path.join(self.run_path, f"audio_{short_num}.mp3")
                 self.interesting_parts_audio[short_num].write_audiofile(audio_dest)
                 audio_clip = whisper.audio.load_audio(audio_dest, sr=whisper_freq)
                 time_shift = self.interesting_times[short_num][0]
@@ -550,12 +607,13 @@ class BestClips:
         print(f"Chat GPT's response is:\n{assistant_reply}\n\nCost of input: ${cost_of_input}\nCost of output: ${cost_of_output}\nTotal cost: ${total_cost}\n\n")
 
         regg = "\d{1,6}\s*-\s*\d{1,6}"
-        span = list(dict.fromkeys(re.compile(regg).findall(assistant_reply.replace("Index",""))))[0]
+        res = list(dict.fromkeys(re.compile(regg).findall(assistant_reply.replace("Index",""))))
+        span = res[0] if len(res) > 0 else "0-120"
         cut = (int(span.split('-')[0]), int(span.split('-')[1]))
         text_length = cut[1] - cut[0]
         final_start_index = cut[0]
         final_end_index = cut[1] if (text_length > 100 and text_length < 300) else cut[0] + 150 # In case Chat GPT returned short or long range
-
+        final_end_index = min(final_end_index, len(df) - 1)
         # Find the nearest sentence to end on
         current_index = final_end_index
 
@@ -651,8 +709,22 @@ class BestClips:
             else:
                 resp = RetinaFace.detect_faces(image, threshold=0.95, model=retina_face_model, allow_upscaling=False)
                 if not isinstance(resp, tuple):
-                    iter_boxes = [(face['facial_area'][0], face['facial_area'][1], face['facial_area'][2], face['facial_area'][3]) for face in resp.values()]
-                    iter_confs = [face['score'] for face in resp.values()]
+                    straight = [face['landmarks']['right_eye'][0] <= face['landmarks']['left_eye'][0] for face in resp.values()]
+                    iter_boxes_first = [(face['facial_area'][0], face['facial_area'][1], face['facial_area'][2], face['facial_area'][3]) for face in resp.values()]
+                    iter_confs_first = [face['score'] for face in resp.values()]
+
+                    iter_boxes = []
+                    iter_confs = []
+                    for i in range(len(iter_confs_first)):
+                        if straight[i]:
+                            iter_boxes.append(iter_boxes_first[i])
+                            iter_confs.append(iter_confs_first[i])
+                        else:
+                            print("upside")
+
+
+
+
                     faces_indexes_sorted_by_conf = np.argsort(iter_confs)[::-1]
 
                     for i in faces_indexes_sorted_by_conf:
@@ -680,11 +752,16 @@ class BestClips:
         cuts_times = []
         cuts_times_inds = []
         cuts_poses = []
+        cuts_faces_places = []
         last_xy = np.array([[-500,-500]], dtype='float64')
         last_cut = np.array([[-500,-500]], dtype='float64')
-        FIXED_NUMBER = 0.06
-        FAR_NUMBER = 0.06
+        FIXED_NUMBER = 0.035
+        EDGE_PIXELS_SPARE = 0.025
         MIN_DISTANCE = 0.01
+        maximal_face_size_x = 0.2
+        maximal_face_size_y = 0.4
+
+
         last_people_change_time = 0
         num_of_people_on_screen = 0
 
@@ -697,10 +774,12 @@ class BestClips:
                 
                 # Check if there are duplicate points
                 filtered_xys = []
+                filtered_bs = []
                 for i in range(len(xys_sorted)):
                     if not any(np.linalg.norm(xys_sorted[i] - filtered_point, axis=-1) <= MIN_DISTANCE for filtered_point in filtered_xys):
                         # Include the point if it's far enough from all previously filtered points
                         filtered_xys.append(xys_sorted[i])
+                        filtered_bs.append(bs_sorted[i])
 
                 fixed = [np.min(np.linalg.norm(filtered_xys - last_xy_i, axis=-1)) <= FIXED_NUMBER for last_xy_i in last_xy]
 
@@ -712,6 +791,11 @@ class BestClips:
                     if fixed[i]:
                         best_fit_ind = np.argmin(np.linalg.norm(filtered_xys - last_xy[i], axis = 1))
                         last_xy[i] = filtered_xys[best_fit_ind]
+                        curr_face = filtered_bs[best_fit_ind]
+                        resized_face = [max(((curr_face[0] + curr_face[1]) / 2) - maximal_face_size_x, curr_face[0]), min(((curr_face[0] + curr_face[1]) / 2) + maximal_face_size_x, curr_face[1]), max(((curr_face[2] + curr_face[3]) / 2) - maximal_face_size_y, curr_face[2]), min(((curr_face[2] + curr_face[3]) / 2) + maximal_face_size_y, curr_face[3])]
+                        if np.any(np.array([resized_face[0], resized_face[2]]) < (last_cut[i] - np.array([0.158,0.5 / len(last_xy)]) + EDGE_PIXELS_SPARE)) or np.any(np.array([resized_face[1], resized_face[3]]) > (last_cut[i] + np.array([0.158,0.5 / len(last_xy)]) - EDGE_PIXELS_SPARE)):
+                            changed = True
+
 
                 if np.sum(fixed) == 0:
                     last_xy = filtered_xys[:2]
@@ -727,38 +811,34 @@ class BestClips:
 
                     num_of_people_on_screen = len(last_xy) if len(last_xy) < 3 else 2                    
                     
-                    if (len(last_cut) != len(last_xy)):                      
-                        last_cut = last_xy.copy()
-                        cuts_times.append(times[ind])
-                        cuts_times_inds.append(ind)
-                        cuts_poses.append([(last_xy[jk][0], last_xy[jk][1]) for jk in range(len(last_xy))])
-                        
-                    elif not np.array([np.min(np.linalg.norm(last_cut - last_xy_i, axis=1)) <= FAR_NUMBER for last_xy_i in last_xy]).all():
-                        last_cut = last_xy.copy()
-                        cuts_times.append(times[ind])
-                        cuts_times_inds.append(ind)
-                        cuts_poses.append([(last_xy[jk][0], last_xy[jk][1]) for jk in range(len(last_xy))])
+                    last_cut = last_xy.copy()
+                    cuts_times.append(times[ind])
+                    cuts_times_inds.append(ind)
+                    cuts_poses.append([(last_xy[jk][0], last_xy[jk][1]) for jk in range(len(last_xy))])
+
 
         if num_of_people_on_screen == 1:
             people_on_screen['1_person'].append((last_people_change_time, dur))
         else:
             people_on_screen['2_people'].append((last_people_change_time, dur))
+
         self.people_on_screen_times[short_num] = people_on_screen
         
         new_vids = []
-        MIN_LENGTH = 0.2
-        final_inds = [True] + list(np.diff(np.array(cuts_times)) > MIN_LENGTH)
-        cuts_times_inds = np.array(cuts_times_inds)[final_inds]
-
-        cuts_poses_final = []
-        for i in range(len(final_inds)):
-            if final_inds[i]:
-                cuts_poses_final.append(cuts_poses[i])
-
-        cuts_poses = cuts_poses_final
-
-        cuts_times = np.array(cuts_times)[final_inds]
-        
+        # MIN_LENGTH = 0.2
+        # final_inds = [True] + list(np.diff(np.array(cuts_times)) > MIN_LENGTH)
+        # print(final_inds)
+        # cuts_times_inds = np.array(cuts_times_inds)[final_inds]
+        #
+        # cuts_poses_final = []
+        # for i in range(len(final_inds)):
+        #     if final_inds[i]:
+        #         cuts_poses_final.append(cuts_poses[i])
+        #
+        # cuts_poses = cuts_poses_final
+        #
+        # cuts_times = np.array(cuts_times)[final_inds]
+        #
 
         for i in range(len(cuts_times)):
             if i == len(cuts_times) - 1:
@@ -774,6 +854,8 @@ class BestClips:
                 new_vids.append(sub_vid)
 
             elif len(cuts_poses[i]) == 2:
+                cuts_poses[i] = sorted(cuts_poses[i], key = lambda x : x[0])
+
                 sub_vid1 = sub_vid.resize(height=1280)
 
                 sub_vid1 = sub_vid1.crop(x1=min(max(0, (2275 * cuts_poses[i][0][0] - 360)), 2275 - 720),
@@ -788,12 +870,36 @@ class BestClips:
                                         x2=min(max((2275 * cuts_poses[i][1][0]) + 360, 720), 2275),
                                         y2=min(max((1280 * cuts_poses[i][1][1]) + int(1280 / 4), int(1280 / 2)), 1280))
 
-                if  cuts_poses[i][0][0] > cuts_poses[i][1][0]:
-                    new_vids.append(clips_array([[sub_vid1],
+                new_vids.append(clips_array([[sub_vid1],
                                     [sub_vid2]]))
-                else:
-                    new_vids.append(clips_array([[sub_vid2],
-                                    [sub_vid1]]))
+
+            # elif len(cuts_poses[i]) == 3:
+            #     cuts_poses[i] = sorted(cuts_poses[i], key = lambda x : x[0])
+            #     sub_vid1 = sub_vid.resize(height=1280)
+            #
+            #     sub_vid1 = sub_vid1.crop(x1=min(max(0, (2275 * cuts_poses[i][0][0] - 360)), 2275 - 720),
+            #                             y1=min(max(0, (1280 * cuts_poses[i][0][1] - int(1280 / 4))), 1280 - int(1280 / 2)),
+            #                             x2=min(max((2275 * cuts_poses[i][0][0]) + 360, 720), 2275),
+            #                             y2=min(max((1280 * cuts_poses[i][0][1]) + int(1280 / 4), int(1280 / 2)), 1280))
+            #
+            #     sub_vid2 = sub_vid.resize(height=1280)
+            #
+            #     sub_vid2 = sub_vid2.crop(x1=min(max(0, (2275 * cuts_poses[i][1][0] - 360)), 2275 - 720),
+            #                             y1=min(max(0, (1280 * cuts_poses[i][1][1] - int(1280 / 4))), 1280 - int(1280 / 2)),
+            #                             x2=min(max((2275 * cuts_poses[i][1][0]) + 360, 720), 2275),
+            #                             y2=min(max((1280 * cuts_poses[i][1][1]) + int(1280 / 4), int(1280 / 2)), 1280))
+            #
+            #     sub_vid3 = sub_vid.resize(height=1280)
+            #
+            #     sub_vid3 = sub_vid3.crop(x1=min(max(0, (2275 * cuts_poses[i][2][0] - 360)), 2275 - 720),
+            #                              y1=min(max(0, (1280 * cuts_poses[i][2][1] - int(1280 / 4))),
+            #                                     1280 - int(1280 / 2)),
+            #                              x2=min(max((2275 * cuts_poses[i][2][0]) + 360, 720), 2275),
+            #                              y2=min(max((1280 * cuts_poses[i][2][1]) + int(1280 / 4), int(1280 / 2)), 1280))
+            #
+            #     new_vids.append(clips_array([[sub_vid1,sub_vid3],
+            #                     [sub_vid2]]))
+
             else:
                 print("Something is wrong.")
                 print(f"The cut positions are: {cuts_poses[i]}")
@@ -873,10 +979,23 @@ class BestClips:
 
         print(f"\n\n\nTotal run cost was:\n${self.total_run_cost}")
 
+    
+    def upload_to_cloud(self):
+        # Delete all of the files in user_cur_run_path if they exist
+        blobs = self.bucket.list_blobs(prefix=f"{self.user_name}/CurrentRun/")
+        for blob in blobs:
+            blob.delete()
+        for i in range(len(self.final_shorts)):
+            video_file_path = os.path.join(self.run_path, f"short_{str(i)}.mp4")
+            json_file_path = os.path.join(self.run_path, f"short_{str(i)}.json")
+            gcloud_video_destination_name = f"{self.date_time_str}__{os.path.basename(video_file_path)}"
+            gcloud_json_destination_name = f"{self.date_time_str}__{os.path.basename(json_file_path)}"
+            upload_to_gcloud(self.bucket, video_file_path, json_file_path, gcloud_video_destination_name, gcloud_json_destination_name, self.user_name)
+
          
 if __name__ == "__main__":
     # # Insert video path to .mp4 file or youtube url link
-    # video = ""
+    # video = "C://Users//along//VS Code//Shorts Project//website//My User//Erling Haaland Predicts KSI Loss Winning Premier League Dillon Danis vs Logan Paul - 392.mp4"
     # username = "My User"
-    # best_clips = BestClips(video_str=video, username=username, use_gpt=True)
+    # best_clips = BestClips(video_str=video, username=username, use_gpt=False)
     pass
