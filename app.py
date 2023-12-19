@@ -1,3 +1,5 @@
+import eventlet
+eventlet.monkey_patch()
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit
@@ -8,6 +10,7 @@ import datetime
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError
 from dotenv import load_dotenv
+
 
 from best_clips import BestClips
 
@@ -68,7 +71,7 @@ def set_upload_complete(userEmail, complete):
         print(f"An error occurred while setting upload_complete for {userEmail}: {e}")
         raise e  # Reraising the exception will help to identify if there is an issue with the database operation
 
-def upload_to_gcloud(bucket, video_file_name, json_file_name, video_destination_blob_name, json_destination_blob_name, userEmail):
+def upload_to_gcloud(bucket, video_file_name, json_file_name, video_destination_blob_name, json_destination_blob_name, userEmail, socketio):
     if not userEmail:
         print("Error: User ID is None or empty.")
         return False
@@ -87,59 +90,105 @@ def upload_to_gcloud(bucket, video_file_name, json_file_name, video_destination_
         return False
 
     try:
+        storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+        bucket = storage_client.bucket(bucket)
+
+        # Upload Video to Previous Runs
         blob_prev_video = bucket.blob(user_prev_runs_path_video)
         blob_prev_video.upload_from_filename(video_file_name)
+        socketio.emit('upload_progress', {'progress': 25, 'userEmail': userEmail}, namespace='/')
+
+        # Upload JSON to Previous Runs
         blob_prev_json = bucket.blob(user_prev_runs_path_json)
         blob_prev_json.upload_from_filename(json_file_name)
+        socketio.emit('upload_progress', {'progress': 50, 'userEmail': userEmail}, namespace='/')
+
+        # Upload Video to Current Run
         blob_cur_video = bucket.blob(user_cur_run_path_video)
         blob_cur_video.upload_from_filename(video_file_name)
+        socketio.emit('upload_progress', {'progress': 75, 'userEmail': userEmail}, namespace='/')
+
+        # Upload JSON to Current Run
         blob_cur_json = bucket.blob(user_cur_run_path_json)
         blob_cur_json.upload_from_filename(json_file_name)
+        socketio.emit('upload_progress', {'progress': 100, 'userEmail': userEmail}, namespace='/')
 
         print(f"File {video_file_name} and {json_file_name} uploaded to {user_cur_run_path_video}, {user_prev_runs_path_video} and {user_cur_run_path_json}, {user_prev_runs_path_json} respectively.")
         return True
     except Exception as e:
         print(f"Failed to upload {video_file_name} or {json_file_name}: {e}")
+        socketio.emit('upload_error', {'error': str(e), 'userEmail': userEmail}, namespace='/')
         return False
 
-
-def process_youtube_video(link, userEmail):
+def process_youtube_video(link, userEmail, socketio):
     set_upload_complete(userEmail, False)  # Set the upload_complete flag to False at the start
-    
-    try:
-        username = userEmail  # Use userEmail for the folder name
 
-        # Pass save_folder_name to BestClips constructor
-        best_clips = BestClips(link, username, use_gpt=True) # Change use_gpt to True if you're not debugging and want to see the best parts
-        
+    try:
+        # Initialize total progress
+        total_progress = 0
+        socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Starting processing'}, namespace='/')
+
+        # Downloading Video - 10% of total progress
+        # Assuming a function to download the video
+        # download_video(link)
+        total_progress += 10
+        socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Video downloaded'}, namespace='/')
+
+        # Video Editing - 40% of total progress
+        best_clips = BestClips(link, userEmail, use_gpt=True)
+        num_clips = len(best_clips.final_shorts)
+        for i, _ in enumerate(best_clips.final_shorts):
+            # Assuming each clip is processed here
+            # process_clip(clip)
+            
+            # Update progress after processing each clip
+            progress_increment = 40 / num_clips
+            total_progress += progress_increment
+            socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Editing videos'}, namespace='/')
+
+        # Preparing for Upload - 10% of total progress
+        # Any preparation before upload (e.g., file conversion)
+        total_progress += 10
+        socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Preparing for upload'}, namespace='/')
+
+        # Uploading to Google Cloud - 40% of total progress
         gcloud_bucket_name = "clipitshorts"
-        # Delete all of the files in user_cur_run_path if they exist
-        storage_client = storage.Client.from_service_account_json(google_cloud_key_file)
+        storage_client = storage.Client.from_service_account_json('google_cloud_key_file')
         bucket = storage_client.bucket(gcloud_bucket_name)
+
+        # Delete current run files if they exist
         blobs = bucket.list_blobs(prefix=f"{userEmail}/CurrentRun/")
         for blob in blobs:
             blob.delete()
-        for i in range(len(best_clips.final_shorts)):
+
+        for i, _ in enumerate(best_clips.final_shorts):
             video_file_path = os.path.join(best_clips.run_path, f"short_{str(i)}.mp4")
             json_file_path = os.path.join(best_clips.run_path, f"short_{str(i)}.json")
+
             gcloud_video_destination_name = f"{best_clips.date_time_str}__{os.path.basename(video_file_path)}"
             gcloud_json_destination_name = f"{best_clips.date_time_str}__{os.path.basename(json_file_path)}"
-            upload_to_gcloud(bucket, video_file_path, json_file_path, gcloud_video_destination_name, gcloud_json_destination_name, userEmail)
+
+            # Upload files to Google Cloud
+            upload_to_gcloud(bucket, video_file_path, json_file_path, gcloud_video_destination_name, gcloud_json_destination_name, userEmail, socketio)
+            
+            # Update progress after each upload
+            upload_progress = 40 / num_clips
+            total_progress += upload_progress
+            socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Uploading videos'}, namespace='/')
+
         set_upload_complete(userEmail, True)
-        
+        socketio.emit('progress_update', {'progress': 100, 'userEmail': userEmail, 'status': 'Process completed'}, namespace='/')
+
     except Exception as e:
         print(f"An error occurred in process_youtube_video: {e}")
-        # Handle any other exceptions here
+        socketio.emit('progress_update', {'progress': total_progress, 'userEmail': userEmail, 'status': 'Error occurred', 'error': str(e)}, namespace='/')
 
 
 @app.route('/api/process-youtube-video', methods=['POST'])
-
 def handle_youtube_video():
     data = request.json
     youtube_link = data.get('link')
     userEmail = data.get('userEmail')  # Extract user ID from the request
-    print(f"Received userEmail: {userEmail}")  # Add this line for debugging
-
 
     if not youtube_link:
         return jsonify({'error': 'No YouTube link provided'}), 400
@@ -147,7 +196,8 @@ def handle_youtube_video():
         return jsonify({'error': 'No user ID provided'}), 400
 
     try:
-        thread = threading.Thread(target=process_youtube_video, args=(youtube_link, userEmail))
+        # Start the video processing in a separate thread
+        thread = threading.Thread(target=process_youtube_video, args=(youtube_link, userEmail, socketio))
         thread.start()
         return jsonify({'message': 'YouTube video processing started'})
     except Exception as e:
@@ -206,4 +256,4 @@ def get_user_payment_plan():
     return jsonify({'paymentPlan': payment_plan})
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    socketio.run(app, debug=False, host='127.0.0.1', port=5000)
